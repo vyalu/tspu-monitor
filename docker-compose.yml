@@ -1,0 +1,35 @@
+services:
+  tspu-monitor:
+    build: .
+    image: tspu-monitor:latest
+    container_name: tspu-monitor
+    restart: unless-stopped
+    ports:
+      - "8181:8080"            # веб-интерфейс: http://IP-сервера:8181
+    environment:
+      TZ: Europe/Moscow
+      # Вход по паролю (раскомментируйте и задайте свой):
+      # BASIC_AUTH: "admin:придумайте-пароль"
+      # Если бесплатного лимита Globalping не хватит — бесплатный токен на globalping.io:
+      # GLOBALPING_TOKEN: ""
+    volumes:
+      - tspu-data:/data        # настройки и история (переживают пересборку и перезапуск)
+    # Безопасность: у контейнера отобраны все привилегии, кроме NET_RAW (нужна только traceroute),
+    # файловая система только для чтения, кроме тома с данными и /tmp.
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Проверки должны идти тем же путём, что и у сотрудников.
+    # Если у сервера свой DNS-сервер офиса, укажите его, чтобы контейнер резолвил так же:
+    # dns:
+    #   - <адрес DNS-сервера офиса>
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  tspu-data:
