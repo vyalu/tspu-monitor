@@ -953,9 +953,10 @@ function handleAlerts(){
     });
     if (s.sound) alarmSound();
     var note = [];
-    if (sent) note.push('уведомление браузера');
-    if (s.sound) note.push('звуковой сигнал');
-    $('alNote').textContent = note.length ? 'Отправлено ' + note.join(' и ') : 'Звук и уведомления браузера выключены';
+    if (sent) note.push('отправлено уведомление браузера');
+    if (s.sound) note.push('подан звуковой сигнал');
+    var nt = note.join(', ');
+    $('alNote').textContent = nt ? nt.charAt(0).toUpperCase() + nt.slice(1) : 'Звук и уведомления браузера выключены';
     if (s.popup) openAlert();
   }
   if (alertOpen) {
