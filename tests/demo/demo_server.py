@@ -66,7 +66,7 @@ def scenario():
         return "ok"
 
 
-def fake_check(t, timeout):
+def fake_check(t, timeout, opts=None):
     sc = scenario()
     jitter = lambda b: int(b * random.uniform(0.85, 1.2))
     if t["group"] != "user":
@@ -80,7 +80,13 @@ def fake_check(t, timeout):
         return dict(status="IP_BLOCK", detail="таймаут TCP-соединения", ms=None)
     if t["scheme"] == "tcp":
         return dict(status="OK", detail="TCP-соединение установлено", ms=jitter(BASE.get(host, 50)))
-    return dict(status="OK", detail="", ms=jitter(BASE.get(host, 300)))
+    r = dict(status="OK", detail="", ms=jitter(BASE.get(host, 300)), kbps=jitter(8000), warn=[])
+    if host == "push.example-cloud.com":
+        r.update(h3="fail", warn=[dict(code="QUIC", text="HTTP/3 (QUIC, UDP 443) не проходит: браузер откатится "
+                                                        "на обычное соединение, первая загрузка может тормозить")])
+    elif host == "crm.example.ru":
+        r["h3"] = "ok"
+    return r
 
 
 def fake_globalping(host, port, scheme):

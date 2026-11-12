@@ -161,6 +161,11 @@ main.dim > *{opacity:.55}
 .r-host{font-size:14px;color:var(--muted);overflow-wrap:anywhere}
 .r-status{font-weight:600;margin-top:2px}
 .r-detail{font-size:12.5px;color:var(--muted);overflow-wrap:anywhere}
+.r-warn{display:flex;gap:6px;align-items:flex-start;font-size:13px;color:var(--warn);margin-top:4px;overflow-wrap:anywhere}
+.r-warn svg{width:15px;height:15px;flex:0 0 15px;margin-top:2px}
+.r-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.r-tags .pill{height:21px;font-size:12px;padding:0 8px;font-weight:500}
+.res.warnc{border-color:var(--warn)}
 .r-spark{flex:0 1 220px;min-width:160px}
 .sp-h{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--muted);margin-bottom:4px}
 .sp-ms{font-size:15px;font-weight:600;color:var(--text)}
@@ -297,6 +302,7 @@ h3.sub{font-size:14.5px;font-weight:600;margin-bottom:8px}
 .form-msg{font-size:13.5px;min-height:20px}
 .acct{border-top:1px solid var(--divider);padding:14px 0 6px}
 .acct h3{font-size:14.5px;font-weight:600;margin-bottom:10px}
+.set-sub{font-size:14.5px;font-weight:600;border-top:1px solid var(--divider);padding-top:14px;margin-top:4px}
 .ro-note{font-size:13px;color:var(--muted)}
 
 /* настройки */
@@ -484,6 +490,13 @@ input[role="switch"]:checked::after{transform:translateX(18px)}
       <div class="sw-row"><label for="fGlobal"><input type="checkbox" role="switch" id="fGlobal">При сбое проверять из других сетей (Globalping)</label>
         <span class="muted" style="font-size:12.5px;flex:1 1 100%">Во внешний сервис уходит только имя сайта. Внутренние адреса не отправляются.</span></div>
       <div class="sw-row"><label for="fTrace"><input type="checkbox" role="switch" id="fTrace">При сбое делать трассировку маршрута</label></div>
+      <h3 class="set-sub">Дополнительные проверки <span class="muted" style="font-weight:400;font-size:13px">— дают предупреждение, а не тревогу</span></h3>
+      <div class="sw-row"><label for="fQuic"><input type="checkbox" role="switch" id="fQuic">Проверять HTTP/3 (QUIC)</label>
+        <span class="muted" style="font-size:12.5px;flex:1 1 100%">Только для сайтов, которые объявляют HTTP/3, не чаще раза в 10 минут.</span></div>
+      <div class="sw-row"><label for="fEch"><input type="checkbox" role="switch" id="fEch">Предупреждать, если сайт публикует ECH</label>
+        <span class="muted" style="font-size:12.5px;flex:1 1 100%">С ECH браузер может не открыть сайт, хотя монитор его видит.</span></div>
+      <div class="sw-row"><label for="fChanged"><input type="checkbox" role="switch" id="fChanged">Сверять ответ с обычным (заголовок и размер страницы)</label></div>
+      <div class="fields"><div class="field"><label for="fSlow">Замедление: скорость ниже, кбит/с (0 — не проверять)</label><input id="fSlow" type="number" min="0" max="1000000" inputmode="numeric"></div></div>
       <div class="acct" id="acct">
         <h3>Логин и пароль администратора</h3>
         <div class="fields">
@@ -522,7 +535,8 @@ var LABEL = {
   IP_BLOCK:'нет соединения: блок по IP / белый список', REFUSED:'соединение отклонено',
   SNI_BLOCK:'обрыв на TLS: блок по SNI', FAKE_CERT:'подменённый сертификат (заглушка?)',
   TCP_16_20:'замирает после ~16–20 КБ: TCP 16-20', STALL:'данные перестали идти', ERROR:'ошибка',
-  HTTP_DENIED:'сервер отказал в доступе (HTTP 403/451)', HTTP_ERROR:'сервер ответил ошибкой HTTP'
+  HTTP_DENIED:'сервер отказал в доступе (HTTP 403/451)', HTTP_ERROR:'сервер ответил ошибкой HTTP',
+  HTTP_STUB:'заглушка о блокировке вместо сайта'
 };
 var lbl = function(st){ return LABEL[st] || st; };
 
@@ -703,15 +717,23 @@ function spark(t){
 }
 
 /* ---------- ресурсы ---------- */
+function speed(k){ return k >= 1000 ? (k / 1000).toFixed(k >= 10000 ? 0 : 1).replace('.', ',') + ' Мбит/с' : k + ' кбит/с'; }
 function card(t){
   var g = isGood(t), p = isPend(t), b = !g && !p;
   var col = p ? 'muted' : g ? 'ok' : 'bad', ico = p ? 'pending' : g ? 'ok' : 'bad';
   var showHost = t.name !== t.host && t.name.indexOf(t.host) !== 0;
-  return '<article class="card res' + (b ? ' bad' : '') + '">' +
+  var w = g ? (t.warn || []) : [];
+  if (w.length) { col = 'warn'; ico = 'tri'; }
+  var tags = [];
+  if (g && t.h3) tags.push('<span class="pill '+(t.h3 === 'ok' ? 'ok' : 'warn')+'">HTTP/3: '+(t.h3 === 'ok' ? 'проходит' : 'не проходит')+'</span>');
+  if (g && t.kbps != null) tags.push('<span class="pill" title="Скорость загрузки первых 64 КБ страницы">≈ '+speed(t.kbps)+'</span>');
+  return '<article class="card res' + (b ? ' bad' : w.length ? ' warnc' : '') + '">' +
     '<div class="r-id"><span class="st c-'+col+'">'+ic(ico)+'</span><div class="r-txt">' +
       '<div class="r-line"><span class="r-name'+(showHost ? '' : ' mono')+'">'+esc(t.name)+'</span>' + (showHost ? '<span class="r-host mono">'+esc(t.host)+'</span>' : '') + '</div>' +
-      '<div class="r-status c-'+col+'">'+esc(lbl(t.status))+'</div>' +
+      '<div class="r-status c-'+col+'">'+esc(lbl(t.status))+(w.length ? ', но есть ' + (w.length === 1 ? 'замечание' : 'замечания') : '')+'</div>' +
       (t.detail ? '<div class="r-detail mono">'+esc(t.detail)+'</div>' : '') +
+      w.map(function(x){ return '<div class="r-warn">'+ic('tri')+'<span>'+esc(x.text)+'</span></div>'; }).join('') +
+      (tags.length ? '<div class="r-tags">'+tags.join('')+'</div>' : '') +
       (t.diag_running ? '<div class="r-detail c-info">идёт диагностика…</div>' : '') +
     '</div></div>' +
     '<div class="r-spark">'+spark(t)+'</div>' +
@@ -740,7 +762,7 @@ function renderList(){
     return rank(a[0]) - rank(b[0]) || (rank(a[0]) === 0 ? a[0].since - b[0].since : 0) || a[1] - b[1];
   }).map(function(x){ return x[0]; });
   var minute = Math.floor(now() / 60000);
-  var sig = JSON.stringify([minute, admin(), S.settings.interval, sorted.map(function(t){ return [t.id, t.name, t.status, t.detail, t.ms, t.since, t.spark, t.diag_running]; })]);
+  var sig = JSON.stringify([minute, admin(), S.settings.interval, sorted.map(function(t){ return [t.id, t.name, t.status, t.detail, t.ms, t.since, t.spark, t.diag_running, t.warn, t.h3, t.kbps && Math.round(Math.log(t.kbps) * 4)]; })]);
   $('cntPill').textContent = u.length;
   var nb = u.filter(isBad).length;
   $('failPill').hidden = !nb; $('failPill').textContent = nb + ' ' + pl(nb,'сбой','сбоя','сбоев');
@@ -1145,6 +1167,8 @@ function openSet(){
   $('fInterval').value = s.interval; $('fConfirm').value = s.confirm; $('fTimeout').value = s.timeout;
   $('fSound').checked = s.sound; $('fPopup').checked = s.popup; $('fControls').checked = s.controls;
   $('fGlobal').checked = s.diag_global !== false; $('fTrace').checked = s.diag_trace !== false;
+  $('fQuic').checked = s.quic !== false; $('fEch').checked = s.ech !== false; $('fChanged').checked = s.changed !== false;
+  $('fSlow').value = s.slow_kbps != null ? s.slow_kbps : 300;
   renderNPill();
   $('aUser').value = (S && S.auth && S.auth.user) || ''; $('aOld').value = ''; $('aNew').value = ''; $('aNew2').value = '';
   $('aMsg').textContent = ''; $('aMsg').className = 'form-msg';
@@ -1171,7 +1195,8 @@ $('sSave').onclick = function(){
   api('api/settings', {
     interval: $('fInterval').value, confirm: $('fConfirm').value, timeout: $('fTimeout').value,
     sound: $('fSound').checked, popup: $('fPopup').checked, controls: $('fControls').checked,
-    diag_global: $('fGlobal').checked, diag_trace: $('fTrace').checked
+    diag_global: $('fGlobal').checked, diag_trace: $('fTrace').checked,
+    quic: $('fQuic').checked, ech: $('fEch').checked, changed: $('fChanged').checked, slow_kbps: $('fSlow').value
   }).then(function(){ closeSet(); sigList = ''; sigCtl = ''; poll(); });
 };
 

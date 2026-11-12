@@ -3,7 +3,8 @@
 """
 ТСПУ-монитор — веб-сервис.
 Постоянно проверяет доступность ресурсов из сети, где запущен, определяет тип
-блокировки (DNS / IP / SNI / TCP 16-20 / белые списки) и отдаёт веб-интерфейс.
+блокировки (DNS / IP / SNI / TCP 16-20 / заглушка / белые списки), замечает замедление,
+проблемы HTTP/3 и ECH и отдаёт веб-интерфейс.
 
 Только стандартная библиотека Python 3.10+.
 Переменные окружения:
@@ -40,6 +41,8 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import quic
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -87,9 +90,9 @@ CONTROLS = [
 # Голосование большинством: «работают» — не меньше 75 %, «лежат» — работают не больше 25 %
 MOSTLY_UP, MOSTLY_DOWN = 0.75, 0.25
 
-PENDING, OK, SMALL, DNS, DNS_SPOOF, IP, REFUSED, SNI, CERT, S1620, STALL, ERR, DENIED, HTTP_ERR = (
+PENDING, OK, SMALL, DNS, DNS_SPOOF, IP, REFUSED, SNI, CERT, S1620, STALL, ERR, DENIED, HTTP_ERR, STUB = (
     "PENDING", "OK", "OK_SMALL", "DNS", "DNS_SPOOF", "IP_BLOCK", "REFUSED", "SNI_BLOCK",
-    "FAKE_CERT", "TCP_16_20", "STALL", "ERROR", "HTTP_DENIED", "HTTP_ERROR")
+    "FAKE_CERT", "TCP_16_20", "STALL", "ERROR", "HTTP_DENIED", "HTTP_ERROR", "HTTP_STUB")
 LABELS = {
     PENDING: "проверяется…", OK: "работает", SMALL: "работает",
     DNS: "не резолвится DNS", DNS_SPOOF: "адрес из вашего DNS не работает, другой работает", IP: "нет соединения: блок по IP / белый список",
@@ -97,7 +100,18 @@ LABELS = {
     CERT: "подменённый сертификат (заглушка?)", S1620: "замирает после ~16–20 КБ: TCP 16-20",
     STALL: "данные перестали идти", ERR: "ошибка",
     DENIED: "сервер отказал в доступе (HTTP 403/451)", HTTP_ERR: "сервер ответил ошибкой HTTP",
+    STUB: "заглушка о блокировке вместо сайта",
 }
+# Предупреждения: сайт открывается, но что-то не так. Тревогу не поднимают.
+WARN_ECH, WARN_QUIC, WARN_SLOW, WARN_CHANGED = "ECH", "QUIC", "SLOW", "CHANGED"
+WARN_NAMES = {WARN_ECH: "сайт публикует ECH", WARN_QUIC: "HTTP/3 (QUIC) не проходит",
+              WARN_SLOW: "замедление", WARN_CHANGED: "ответ не похож на обычный"}
+EXTRA_TTL = 1800       # запись HTTPS в DNS (ECH, h3) перечитываем раз в 30 минут
+QUIC_TTL = 600         # QUIC проверяем не чаще раза в 10 минут на адрес
+SPEED_MIN_BYTES = 24 * 1024   # скорость считаем, только если после первого куска пришло столько данных
+# Заглушки провайдеров и РКН: перенаправление на страницу блокировки или её текст в ответе
+STUB_URL_RE = re.compile(r"(?i)(zapret|blocked|blocklist|restrict|eais|rkn\.gov|warning\.rt\.ru|/block\b)")
+STUB_MAX = 48 * 1024   # страницы-заглушки маленькие; большие страницы с этими словами — обычные статьи
 MAX_REDIRECTS = 5
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -142,15 +156,15 @@ def is_private(ip):
         return False
 
 
-def dns_query(host, server=None, timeout=3):
-    """Простой DNS-запрос типа A напрямую к указанному серверу (UDP/53). [] — имени нет."""
+def dns_records(host, qtype=1, server=None, timeout=3):
+    """Простой DNS-запрос напрямую к указанному серверу (UDP/53) → [(тип, rdata)]. [] — имени нет."""
     server = server or ALT_DNS
     qid = random.randint(0, 0xFFFF)
     q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
     for part in host.encode("idna").split(b"."):
         if part:
             q += bytes([len(part)]) + part
-    q += b"\x00" + struct.pack(">HH", 1, 1)
+    q += b"\x00" + struct.pack(">HH", qtype, 1)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     try:
@@ -179,15 +193,62 @@ def dns_query(host, server=None, timeout=3):
     off = 12
     for _ in range(qd):
         off = skip(off) + 4
-    ips = []
+    out = []
     for _ in range(an):
         off = skip(off)
         typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
         off += 10
-        if typ == 1 and rdlen == 4:
-            ips.append(socket.inet_ntoa(data[off:off + 4]))
+        out.append((typ, data[off:off + rdlen]))
         off += rdlen
-    return ips
+    return out
+
+
+def dns_query(host, server=None, timeout=3):
+    """Адреса IPv4 (запись A) от указанного DNS. [] — имени нет."""
+    return [socket.inet_ntoa(r) for typ, r in dns_records(host, 1, server, timeout) if typ == 1 and len(r) == 4]
+
+
+def system_dns():
+    """Первый DNS-сервер системы (в Docker — встроенный 127.0.0.11), иначе альтернативный."""
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 2 and p[0] == "nameserver" and IP_RE.match(p[1]):
+                    return p[1]
+    except OSError:
+        pass
+    return ALT_DNS
+
+
+def dns_https(host):
+    """Запись HTTPS (тип 65): какие протоколы объявлены (alpn) и опубликован ли ключ ECH."""
+    info = dict(alpn=[], ech=False)
+    for server in (system_dns(), ALT_DNS):
+        try:
+            recs = dns_records(host, 65, server)
+            break
+        except Exception:
+            recs = None
+    for typ, r in recs or []:
+        if typ != 65 or len(r) < 3 or r[:2] == b"\x00\x00":   # приоритет 0 — псевдоним, параметров нет
+            continue
+        off = 2
+        while off < len(r) and r[off]:
+            off += r[off] + 1
+        off += 1
+        while off + 4 <= len(r):
+            key, ln = struct.unpack(">HH", r[off:off + 4])
+            val = r[off + 4:off + 4 + ln]
+            off += 4 + ln
+            if key == 1:      # alpn
+                i = 0
+                while i < len(val):
+                    info["alpn"].append(val[i + 1:i + 1 + val[i]].decode("ascii", "replace"))
+                    i += 1 + val[i]
+            elif key == 5:    # ech
+                info["ech"] = True
+    return info
 
 
 def alt_resolve(host):
@@ -242,6 +303,7 @@ def probe(t, ip, timeout, t0=None):
            "Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: ru-RU,ru;q=0.9,en;q=0.8\r\n"
            "Accept-Encoding: identity\r\nConnection: close\r\n\r\n")
     got, broke, head = 0, None, b""
+    t_first = first_len = None
     try:
         sock.settimeout(timeout)
         sock.sendall(req.encode())
@@ -249,6 +311,8 @@ def probe(t, ip, timeout, t0=None):
             chunk = sock.recv(16384)
             if not chunk:
                 break
+            if t_first is None:
+                t_first, first_len = time.monotonic(), len(chunk)
             if len(head) < 16384:
                 head += chunk[:16384 - len(head)]
             got += len(chunk)
@@ -268,6 +332,21 @@ def probe(t, ip, timeout, t0=None):
     res["http"] = int(m.group(1)) if m else None
     loc = re.search(r"(?im)^location:[ \t]*(\S+)", hdr)
     res["location"] = loc.group(1).strip() if loc else None
+    res["altsvc_h3"] = bool(re.search(r"(?im)^alt-svc:.*\bh3(?:-\d+)?=", hdr))
+    res["size"] = got
+    if not broke and t_first is not None and got - first_len >= SPEED_MIN_BYTES:
+        res["kbps"] = round((got - first_len) * 8 / max(time.monotonic() - t_first, 0.001) / 1000)
+    body = head.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in head else b""
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        text = body.decode("cp1251", "replace")
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    res["title"] = re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else None
+    stub = stub_reason(t, res, text.lower(), got)
+    if stub and not (broke and got == 0):
+        res.update(status=STUB, detail=stub)
+        return res
     if broke:
         if got == 0:
             res.update(status=STALL, detail=f"нет ответа после соединения ({broke})")
@@ -280,6 +359,26 @@ def probe(t, ip, timeout, t0=None):
     else:
         res.update(status=SMALL, detail=f"ответ всего {max(1, got // 1024)} КБ — TCP 16-20 по нему не проверить, укажите адрес большого файла")
     return res
+
+
+def stub_reason(t, res, low, got):
+    """Признаки страницы блокировки. Возвращает пояснение или None."""
+    loc = res.get("location")
+    if loc and 300 <= (res.get("http") or 0) < 400:
+        try:
+            lh = (urllib.parse.urlsplit(loc).hostname or "").lower()
+        except ValueError:
+            lh = ""
+        same = not lh or lh == t["host"] or lh.endswith("." + t["host"]) or t["host"].endswith("." + lh)
+        if not same and STUB_URL_RE.search(loc):
+            return f"перенаправление на страницу блокировки: {loc[:120]}"
+    if got <= STUB_MAX and low:
+        rkn = "rkn.gov.ru" in low or "роскомнадзор" in low or "149-фз" in low or "единый реестр" in low
+        limited = any(w in low for w in ("ограничен", "заблокирован", "блокировк", "запрещ"))
+        if rkn and limited:
+            title = f": «{res['title']}»" if res.get("title") else ""
+            return f"в ответе текст о блокировке по решению РКН{title}"
+    return None
 
 
 def http_verdict(res):
@@ -295,9 +394,51 @@ def http_verdict(res):
     return res
 
 
-def check(t, timeout):
+_extra_cache, _extra_lock = {}, threading.Lock()
+
+
+def _cached(key, ttl, fn):
+    with _extra_lock:
+        hit = _extra_cache.get(key)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+    val = fn()
+    with _extra_lock:
+        _extra_cache[key] = (time.time(), val)
+        if len(_extra_cache) > 2000:
+            _extra_cache.clear()
+    return val
+
+
+def extras(t, res, opts):
+    """Дополнительные проверки рабочего сайта: ECH и HTTP/3. Дают предупреждения, не тревогу."""
+    warn = []
+    info = _cached(("https", t["host"]), EXTRA_TTL, lambda: dns_https(t["host"]))
+    if opts.get("ech") and info["ech"]:
+        warn.append(dict(code=WARN_ECH, text="сайт публикует ECH (шифрованное имя): браузер с ECH может "
+                                             "не открыть его, хотя у монитора проверка проходит"))
+    h3 = res.get("altsvc_h3") or "h3" in info["alpn"]
+    res["h3"] = None
+    if opts.get("quic") and h3 and res.get("ip"):
+        def run():
+            try:
+                return quic.probe(res["ip"], t["host"], t["port"], timeout=3)
+            except OSError:
+                return None
+        ok = _cached(("quic", t["host"], res["ip"], t["port"]), QUIC_TTL, run)
+        if ok is not None:
+            res["h3"] = "ok" if ok else "fail"
+        if ok is False:
+            warn.append(dict(code=WARN_QUIC, text="HTTP/3 (QUIC, UDP 443) не проходит: браузер откатится на обычное "
+                                                  "соединение, первая загрузка может тормозить"))
+    res["warn"] = warn
+    return res
+
+
+def check(t, timeout, opts=None):
     """Полная проверка ресурса пользователя: как check_one, но идём по перенаправлениям
     до конечной страницы (как браузер) и учитываем код ответа сервера."""
+    opts = opts or {}
     t0 = time.monotonic()
     res = check_one(t, timeout)
     if t.get("group") not in (None, "user") or t["scheme"] == "tcp" or res["status"] not in GOOD:
@@ -320,6 +461,11 @@ def check(t, timeout):
         http_verdict(res)
     if res["status"] in GOOD and 300 <= (res.get("http") or 0) < 400:
         res.update(status=HTTP_ERR, detail="перенаправления зациклились или их больше " + str(MAX_REDIRECTS))
+    if res["status"] in GOOD and cur["scheme"] == "https":
+        try:
+            extras(cur, res, opts)
+        except Exception as e:
+            log("доп. проверки", cur["host"], e)
     if chain:
         res["ms"] = int((time.monotonic() - t0) * 1000) if res.get("ms") is not None else None
         via = "после перенаправления на " + " → ".join(chain)
@@ -344,6 +490,7 @@ def check_one(t, timeout):
         return dict(status=DNS, detail=detail, ms=None)
 
     res = probe(t, ip, timeout, t0)
+    res["ip"] = ip
     if res["status"] in GOOD or is_private(ip) or IP_RE.match(t["host"]):
         return res
     alt = alt_resolve(t["host"])
@@ -498,7 +645,8 @@ class Monitor:
             CREATE INDEX IF NOT EXISTS diags_tid ON diags(tid, t);
         """)
         self.settings = dict(interval=30, confirm=2, timeout=7, sound=True, popup=True, controls=True,
-                             diag_trace=True, diag_global=True)
+                             diag_trace=True, diag_global=True,
+                             quic=True, ech=True, slow_kbps=300, changed=True)
         self.diag_running = set()
         self.diag_last = {}
         self.gp_times = []
@@ -520,7 +668,8 @@ class Monitor:
     # --- цели
     def _target(self, tid, group, name, p):
         return dict(p, id=tid, group=group, name=name, status=PENDING, detail="", ms=None,
-                    since=now_ms(), fails=0, alerted=False, down_since=None, incident=None)
+                    since=now_ms(), fails=0, alerted=False, down_since=None, incident=None,
+                    warn=[], wseen={}, h3=None, kbps=None, base=None, cand=0)
 
     def active(self):
         return self.user + (self.ctl if self.settings["controls"] else [])
@@ -642,8 +791,9 @@ class Monitor:
             with self.lock:
                 snap = [dict(t) for t in self.active()]
                 timeout = self.settings["timeout"]
+                opts = dict(quic=self.settings["quic"], ech=self.settings["ech"])
             try:
-                results = list(pool.map(lambda t: (t["id"], check(t, timeout)), snap))
+                results = list(pool.map(lambda t: (t["id"], check(t, timeout, opts)), snap))
                 self.apply(results)
             except Exception as e:
                 log("ошибка цикла проверок:", e)
@@ -671,8 +821,11 @@ class Monitor:
                 was_good = t["status"] in GOOD
                 if t["status"] == PENDING or good != was_good:
                     t["since"] = t_now
-                t.update(status=r["status"], detail=r["detail"], ms=r["ms"])
+                t.update(status=r["status"], detail=r["detail"], ms=r["ms"],
+                         h3=r.get("h3"), kbps=r.get("kbps") if good else None)
                 rows.append((tid, t_now, r["status"], r["ms"]))
+                if t["group"] == "user":
+                    self._warnings(t, r, good, confirm, t_now)
 
                 if good:
                     if t["alerted"] and t["group"] == "user":
@@ -701,6 +854,62 @@ class Monitor:
             self._update_mode(t_now)
         if rows:
             self._db("INSERT INTO checks VALUES(?,?,?,?)", rows, many=True)
+
+    def _warnings(self, t, r, good, confirm, t_now):
+        """Предупреждения по рабочему сайту: показываем после `confirm` проверок подряд, пишем в журнал."""
+        found = {w["code"]: w["text"] for w in (r.get("warn") or [])} if good else {}
+        s = self.settings
+        kb = r.get("kbps")
+        if good and s["slow_kbps"] and kb is not None and kb < s["slow_kbps"]:
+            found[WARN_SLOW] = (f"загрузка идёт со скоростью ≈{kb} кбит/с (порог {s['slow_kbps']}) — "
+                                "похоже на замедление")
+        if good and s["changed"] and t["scheme"] != "tcp":
+            ch = self._baseline(t, r)
+            if ch:
+                found[WARN_CHANGED] = ch
+        seen = t["wseen"]
+        for code in list(seen):
+            if code not in found:
+                del seen[code]
+        for code in found:
+            seen[code] = seen.get(code, 0) + 1
+        need = {WARN_ECH: 1}     # ECH — свойство сайта, его не нужно подтверждать
+        shown = [dict(code=c, text=x) for c, x in found.items() if seen[c] >= need.get(c, confirm)]
+        before = {w["code"] for w in t["warn"]}
+        after = {w["code"] for w in shown}
+        if good or not t["warn"]:          # во время сбоя прежние предупреждения не трогаем
+            for w in shown:
+                if w["code"] not in before:
+                    self.event("warn", t["host"], "предупреждение: " + w["text"], t_now)
+            for w in t["warn"]:
+                if w["code"] not in after:
+                    self.event("info", t["host"], "предупреждение снято: " + WARN_NAMES[w["code"]], t_now)
+            t["warn"] = shown
+
+    @staticmethod
+    def _baseline(t, r):
+        """Сверка с обычным ответом сайта (как у OONI, только эталон — свои же прошлые проверки):
+        заметно другой заголовок страницы и в разы меньший объём — значит, отдают не то."""
+        title, size = r.get("title"), r.get("size") or 0
+        b = t["base"]
+        if not b or (b["n"] < 5 and b["title"] != title):
+            t["base"], t["cand"] = dict(title=title, size=size, n=1), 0
+            return None
+        if b["title"] == title:
+            b["n"] += 1
+            b["size"] = round(b["size"] * 0.8 + size * 0.2)
+            t["cand"] = 0
+            return None
+        t["cand"] += 1
+        if t["cand"] >= 20:               # новый вид держится 20 проверок — сайт, видимо, обновили
+            t["base"], t["cand"] = dict(title=title, size=size, n=5), 0
+            return None
+        if b["size"] and size < b["size"] * 0.5:
+            was = f"«{b['title']}»" if b["title"] else "без заголовка"
+            now = f"«{title}»" if title else "без заголовка"
+            return (f"ответ не похож на обычный: заголовок {now} вместо {was}, "
+                    f"{max(1, size // 1024)} КБ вместо ≈{max(1, b['size'] // 1024)} КБ")
+        return None
 
     def _update_mode(self, t_now):
         if not self.settings["controls"]:
@@ -850,6 +1059,7 @@ class Monitor:
                                     url=t["url"], status=t["status"], label=LABELS[t["status"]],
                                     detail=t["detail"], ms=t["ms"], since=t["since"], fails=t["fails"],
                                     alerted=t["alerted"], diag_running=t["id"] in self.diag_running,
+                                    warn=t["warn"], h3=t["h3"], kbps=t["kbps"],
                                     spark=self.spark(t["id"], t_now) if t["group"] == "user" else []))
             next_in = max(0, round(self.next_at - time.time())) if (self.running and self.next_at) else None
             st = dict(version=VERSION, running=self.running, checked_at=self.checked_at, next_in=next_in, now=t_now,
@@ -945,7 +1155,8 @@ class Monitor:
             if "interval" in d: s["interval"] = clamp(d["interval"], 5, 3600, s["interval"])
             if "confirm" in d: s["confirm"] = clamp(d["confirm"], 1, 20, s["confirm"])
             if "timeout" in d: s["timeout"] = clamp(d["timeout"], 2, 30, s["timeout"])
-            for k in ("sound", "popup", "controls", "diag_trace", "diag_global"):
+            if "slow_kbps" in d: s["slow_kbps"] = clamp(d["slow_kbps"], 0, 1_000_000, s["slow_kbps"])
+            for k in ("sound", "popup", "controls", "diag_trace", "diag_global", "quic", "ech", "changed"):
                 if k in d:
                     s[k] = bool(d[k])
             self.save()
