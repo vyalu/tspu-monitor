@@ -166,6 +166,12 @@ main.dim > *{opacity:.55}
 .r-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .r-tags .pill{height:21px;font-size:12px;padding:0 8px;font-weight:500}
 .res.warnc{border-color:var(--warn)}
+.r-lay{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;font-size:12.5px}
+.r-lay .pill{height:22px;font-size:12.5px;padding:0 9px;cursor:help}
+.r-lay .lk{color:var(--muted);margin-right:2px}
+.r-lay .pill.bad{font-weight:700}
+.r-lay .pill.okl{background:transparent;border:1px solid var(--border2);color:var(--muted);font-weight:500}
+.r-lay .pill.unk{background:transparent;border:1px dashed var(--border2);color:var(--muted);font-weight:500}
 .r-spark{flex:0 1 220px;min-width:160px}
 .sp-h{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--muted);margin-bottom:4px}
 .sp-ms{font-size:15px;font-weight:600;color:var(--text)}
@@ -717,6 +723,20 @@ function spark(t){
 }
 
 /* ---------- ресурсы ---------- */
+function layersHtml(t){
+  var L = t.layers || [];
+  if (!L.length) return '';
+  var pill = function(x, cls){ return '<span class="pill '+cls+'" tabindex="0" title="'+esc(x.text)+'">'+esc(x.name)+'</span>'; };
+  var by = function(st){ return L.filter(function(x){ return x.state === st; }); };
+  var b = by('block'), o = by('ok'), u = by('unknown');
+  return '<div class="r-lay"><span class="lk">Блокировки сейчас:</span>' +
+    (b.length ? b.map(function(x){ return pill(x, 'bad'); }).join('') : '<span class="muted">не найдены — похоже на сбой у самого сервера</span>') + '</div>' +
+    (o.length || u.length ? '<div class="r-lay"><span class="lk">Не блокируется:</span>' + (o.length ? o.map(function(x){ return pill(x, 'okl'); }).join('') : '<span class="muted">—</span>') +
+      (u.length ? '<span class="lk" style="margin-left:6px">не проверить:</span>' + u.map(function(x){ return pill(x, 'unk'); }).join('') : '') + '</div>' : '');
+}
+function layerNames(t){
+  return (t.layers || []).filter(function(x){ return x.state === 'block'; }).map(function(x){ return x.name; }).join(', ');
+}
 function speed(k){ return k >= 1000 ? (k / 1000).toFixed(k >= 10000 ? 0 : 1).replace('.', ',') + ' Мбит/с' : k + ' кбит/с'; }
 function card(t){
   var g = isGood(t), p = isPend(t), b = !g && !p;
@@ -732,6 +752,7 @@ function card(t){
       '<div class="r-line"><span class="r-name'+(showHost ? '' : ' mono')+'">'+esc(t.name)+'</span>' + (showHost ? '<span class="r-host mono">'+esc(t.host)+'</span>' : '') + '</div>' +
       '<div class="r-status c-'+col+'">'+esc(lbl(t.status))+(w.length ? ', но есть ' + (w.length === 1 ? 'замечание' : 'замечания') : '')+'</div>' +
       (t.detail ? '<div class="r-detail mono">'+esc(t.detail)+'</div>' : '') +
+      (b ? layersHtml(t) : '') +
       w.map(function(x){ return '<div class="r-warn">'+ic('tri')+'<span>'+esc(x.text)+'</span></div>'; }).join('') +
       (tags.length ? '<div class="r-tags">'+tags.join('')+'</div>' : '') +
       (t.diag_running ? '<div class="r-detail c-info">идёт диагностика…</div>' : '') +
@@ -762,7 +783,7 @@ function renderList(){
     return rank(a[0]) - rank(b[0]) || (rank(a[0]) === 0 ? a[0].since - b[0].since : 0) || a[1] - b[1];
   }).map(function(x){ return x[0]; });
   var minute = Math.floor(now() / 60000);
-  var sig = JSON.stringify([minute, admin(), S.settings.interval, sorted.map(function(t){ return [t.id, t.name, t.status, t.detail, t.ms, t.since, t.spark, t.diag_running, t.warn, t.h3, t.kbps && Math.round(Math.log(t.kbps) * 4)]; })]);
+  var sig = JSON.stringify([minute, admin(), S.settings.interval, sorted.map(function(t){ return [t.id, t.name, t.status, t.detail, t.ms, t.since, t.spark, t.diag_running, t.warn, t.h3, t.kbps && Math.round(Math.log(t.kbps) * 4), t.layers]; })]);
   $('cntPill').textContent = u.length;
   var nb = u.filter(isBad).length;
   $('failPill').hidden = !nb; $('failPill').textContent = nb + ' ' + pl(nb,'сбой','сбоя','сбоев');
@@ -972,7 +993,7 @@ function handleAlerts(){
     var sent = false;
     fresh.forEach(function(t){
       notified[keyOf(t)] = 1;
-      sent = notify('Недоступен: ' + t.host, lbl(t.status) + '. ' + (t.detail || ''), true) || sent;
+      sent = notify('Недоступен: ' + t.host, lbl(t.status) + '. ' + (layerNames(t) ? 'Блокировки: ' + layerNames(t) + '. ' : '') + (t.detail || ''), true) || sent;
     });
     if (s.sound) alarmSound();
     var note = [];
@@ -1003,7 +1024,7 @@ function renderAlert(){
   $('alTitle').textContent = (n === 1 ? 'Недоступен ' : 'Недоступны ') + n + ' ' + pl(n,'ресурс','ресурса','ресурсов');
   $('alList').innerHTML = list.map(function(t){
     return '<li><div class="al-host mono">'+esc(t.host)+'</div>' + (t.name !== t.host ? '<div class="muted">'+esc(t.name)+'</div>' : '') +
-      '<div class="al-type">'+esc(lbl(t.status))+'</div>' + (t.detail ? '<div class="al-det mono">'+esc(t.detail)+'</div>' : '') +
+      '<div class="al-type">'+esc(lbl(t.status))+'</div>' + (layerNames(t) ? '<div class="al-det">Блокировки сейчас: <b>'+esc(layerNames(t))+'</b></div>' : '') + (t.detail ? '<div class="al-det mono">'+esc(t.detail)+'</div>' : '') +
       '<div class="al-meta">Недоступен с '+hms(t.since)+' · уже '+dur(now() - t.since)+' · '+t.fails+' '+pl(t.fails,'проверка','проверки','проверок')+' подряд</div></li>';
   }).join('');
   alertShown = list.slice();

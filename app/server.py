@@ -106,6 +106,11 @@ LABELS = {
 WARN_ECH, WARN_QUIC, WARN_SLOW, WARN_CHANGED = "ECH", "QUIC", "SLOW", "CHANGED"
 WARN_NAMES = {WARN_ECH: "сайт публикует ECH", WARN_QUIC: "HTTP/3 (QUIC) не проходит",
               WARN_SLOW: "замедление", WARN_CHANGED: "ответ не похож на обычный"}
+# Уровни блокировки: какие механизмы сейчас действуют на ресурс (может быть несколько сразу)
+L_DNS, L_IP, L_SNI, L_DATA, L_HTTP, L_QUIC, L_WL = "DNS", "IP", "SNI", "DATA", "HTTP", "QUIC", "WL"
+LAYER_NAMES = {L_DNS: "DNS", L_IP: "по IP", L_SNI: "по SNI", L_DATA: "обрыв загрузки",
+               L_HTTP: "заглушка / отказ", L_QUIC: "HTTP/3 (QUIC)", L_WL: "белые списки"}
+LAYER_TTL = 120        # разбор по уровням для одного ресурса — не чаще раза в 2 минуты
 EXTRA_TTL = 1800       # запись HTTPS в DNS (ECH, h3) перечитываем раз в 30 минут
 QUIC_TTL = 600         # QUIC проверяем не чаще раза в 10 минут на адрес
 SPEED_MIN_BYTES = 24 * 1024   # скорость считаем, только если после первого куска пришло столько данных
@@ -395,6 +400,7 @@ def http_verdict(res):
 
 
 _extra_cache, _extra_lock = {}, threading.Lock()
+H3_SEEN = set()   # сайты, которые хоть раз объявили HTTP/3 в заголовке Alt-Svc
 
 
 def _cached(key, ttl, fn):
@@ -417,6 +423,8 @@ def extras(t, res, opts):
     if opts.get("ech") and info["ech"]:
         warn.append(dict(code=WARN_ECH, text="сайт публикует ECH (шифрованное имя): браузер с ECH может "
                                              "не открыть его, хотя у монитора проверка проходит"))
+    if res.get("altsvc_h3"):
+        H3_SEEN.add(t["host"])
     h3 = res.get("altsvc_h3") or "h3" in info["alpn"]
     res["h3"] = None
     if opts.get("quic") and h3 and res.get("ip"):
@@ -441,6 +449,7 @@ def check(t, timeout, opts=None):
     opts = opts or {}
     t0 = time.monotonic()
     res = check_one(t, timeout)
+    res["at"] = t
     if t.get("group") not in (None, "user") or t["scheme"] == "tcp" or res["status"] not in GOOD:
         return res
     chain = []
@@ -455,6 +464,7 @@ def check(t, timeout, opts=None):
                      + (nxt["path"] if nxt["path"] != "/" else ""))
         cur = dict(nxt, group=t.get("group"))
         res = check_one(cur, timeout)
+        res["at"] = cur
         if res["status"] not in GOOD:
             break
     if res["status"] in GOOD:
@@ -471,6 +481,141 @@ def check(t, timeout, opts=None):
         via = "после перенаправления на " + " → ".join(chain)
         res["detail"] = (via + (": " + res["detail"] if res.get("detail") else "")) if res["status"] not in GOOD \
             else (via + (" · " + res["detail"] if res.get("detail") else ""))
+    return res
+
+
+def tls_try(ip, port, sni, timeout):
+    """Одно TLS-рукопожатие с заданным именем → ok (сервер ответил, хоть бы и ошибкой TLS) /
+    reset / timeout / eof / tcp (не удалось даже соединиться)."""
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+    except OSError:
+        return "tcp"
+    try:
+        sock.settimeout(timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.wrap_socket(sock, server_hostname=sni).close()
+        return "ok"
+    except socket.timeout:
+        return "timeout"
+    except ConnectionResetError:
+        return "reset"
+    except ssl.SSLError as e:
+        msg = str(e).upper()
+        if "ALERT" in msg or "WRONG_VERSION" in msg or "CERTIFICATE" in msg:
+            return "ok"           # ответил сам сервер — имя до него дошло
+        return "eof" if "EOF" in msg else "reset"
+    except OSError:
+        return "reset"
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def sni_test(host, neutral, timeout):
+    """Режут ли имя сайта само по себе: отправляем его в TLS на заведомо доступный посторонний сервер.
+    Сравниваем с тем же сервером и случайным безобидным именем — так поведение сервера не путается с блокировкой."""
+    dummy = f"check-{secrets.token_hex(4)}.example.com"
+    for ip in neutral:
+        base = tls_try(ip, 443, dummy, timeout)
+        if base not in ("ok", "eof"):
+            continue          # посторонний сервер сейчас сам недоступен — берём следующий
+        got = tls_try(ip, 443, host, timeout)
+        if got == base or got == "ok":
+            return dict(code=L_SNI, state="ok", text="имя сайта не в списке ТСПУ: с ним соединение с посторонним сервером проходит")
+        how = {"reset": "соединение сбрасывается", "timeout": "соединение замирает", "eof": "соединение обрывается",
+               "tcp": "соединение не устанавливается"}.get(got, got)
+        return dict(code=L_SNI, state="block", text=f"имя сайта в списке ТСПУ: с ним {how} даже на постороннем сервере ({ip})")
+    return dict(code=L_SNI, state="unknown", text="не с чем сравнить: нет доступного контрольного сервера")
+
+
+def layers(at, res, opts, timeout):
+    """Разбор по уровням: какие блокировки сейчас действуют на ресурс. Основная проверка
+    останавливается на первом сбое; здесь проверяем каждый уровень отдельно."""
+    st, host, port, scheme = res["status"], at["host"], at["port"], at["scheme"]
+    timeout = min(timeout, 5)
+    out = []
+    if scheme == "tcp" or IP_RE.match(host):
+        if st in (IP, REFUSED):
+            out.append(dict(code=L_IP, state="block", text=LABELS[st]))
+        else:
+            out.append(dict(code=L_IP, state="ok", text="TCP-соединение устанавливается"))
+        if scheme == "https" and st == SNI:
+            out.append(dict(code=L_SNI, state="unknown", text="по голому IP имя сайта не передаётся"))
+    else:
+        try:
+            sys_ip = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+        except (OSError, UnicodeError):
+            sys_ip = None
+        alt = alt_resolve(host)
+        if st == DNS:
+            out.append(dict(code=L_DNS, state="block" if alt else "unknown",
+                            text=f"системный DNS не отдаёт адрес, {ALT_DNS_NAME} отдаёт {alt[0]}" if alt
+                            else "имени не знает ни один DNS — возможно, адрес указан с ошибкой"))
+        elif st == DNS_SPOOF:
+            out.append(dict(code=L_DNS, state="block", text=res.get("detail") or LABELS[DNS_SPOOF]))
+        else:
+            out.append(dict(code=L_DNS, state="ok", text="адрес получен"))
+        real = (alt[0] if alt else None) if st in (DNS, DNS_SPOOF) else (sys_ip or (alt[0] if alt else None))
+        jobs = {}
+        if real:
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                def ip_job():
+                    try:
+                        socket.create_connection((real, port), timeout=timeout).close()
+                        return dict(code=L_IP, state="ok", text=f"TCP-соединение с {real} устанавливается")
+                    except ConnectionRefusedError:
+                        return dict(code=L_IP, state="block", text=f"{real}: соединение отклонено")
+                    except OSError:
+                        return dict(code=L_IP, state="block", text=f"{real}: TCP-соединение не устанавливается")
+                jobs["ip"] = ex.submit(ip_job)
+                if scheme == "https" and not is_private(real):
+                    neutral = [x for x in opts.get("neutral", []) if x != real]
+                    jobs["sni"] = ex.submit(sni_test, host, neutral, timeout)
+                    info = _cached(("https", host), EXTRA_TTL, lambda: dns_https(host))
+                    if opts.get("quic", True) and (host in H3_SEEN or "h3" in info["alpn"]):
+                        def q_job():
+                            def run():
+                                try:
+                                    return quic.probe(real, host, port, timeout=3)
+                                except OSError:
+                                    return None
+                            ok = _cached(("quic", host, real, port), QUIC_TTL, run)
+                            if ok is None:
+                                return dict(code=L_QUIC, state="unknown", text="UDP недоступен для проверки")
+                            return dict(code=L_QUIC, state="ok" if ok else "block",
+                                        text="QUIC проходит" if ok else "первый пакет QUIC с именем сайта остаётся без ответа")
+                        jobs["quic"] = ex.submit(q_job)
+                for k in ("ip", "sni", "quic"):
+                    if k in jobs:
+                        try:
+                            out.append(jobs[k].result())
+                        except Exception as e:
+                            log("разбор по уровням", host, k, e)
+        else:
+            out.append(dict(code=L_IP, state="unknown", text="адрес сайта неизвестен — проверить нечем"))
+    if st in (S1620, STALL):
+        out.append(dict(code=L_DATA, state="block", text=LABELS[st]))
+    if st in (STUB, CERT, DENIED):
+        out.append(dict(code=L_HTTP, state="block", text=LABELS[st]))
+    return out
+
+
+def check_full(t, timeout, opts):
+    """Проверка + при сбое ресурса пользователя — разбор по уровням (с кэшем на 2 минуты)."""
+    res = check(t, timeout, opts)
+    if t.get("group") == "user" and res["status"] not in GOOD and "layers" not in res:
+        at = res.get("at") or t
+        try:
+            res["layers"] = _cached(("layers", at["url"], res["status"]), LAYER_TTL,
+                                    lambda: layers(at, res, opts, timeout))
+        except Exception as e:
+            log("разбор по уровням", at["host"], e)
+    res.pop("at", None)
     return res
 
 
@@ -669,7 +814,7 @@ class Monitor:
     def _target(self, tid, group, name, p):
         return dict(p, id=tid, group=group, name=name, status=PENDING, detail="", ms=None,
                     since=now_ms(), fails=0, alerted=False, down_since=None, incident=None,
-                    warn=[], wseen={}, h3=None, kbps=None, base=None, cand=0)
+                    warn=[], wseen={}, h3=None, kbps=None, base=None, cand=0, ip=None, layers=[])
 
     def active(self):
         return self.user + (self.ctl if self.settings["controls"] else [])
@@ -791,9 +936,12 @@ class Monitor:
             with self.lock:
                 snap = [dict(t) for t in self.active()]
                 timeout = self.settings["timeout"]
-                opts = dict(quic=self.settings["quic"], ech=self.settings["ech"])
+                # посторонние серверы для проверки SNI — рабочие контрольные, сначала зарубежные
+                neutral = [t["ip"] for g in ("foreign", "ru") for t in self.ctl
+                           if t["group"] == g and t["status"] in GOOD and t.get("ip")][:4]
+                opts = dict(quic=self.settings["quic"], ech=self.settings["ech"], neutral=neutral)
             try:
-                results = list(pool.map(lambda t: (t["id"], check(t, timeout, opts)), snap))
+                results = list(pool.map(lambda t: (t["id"], check_full(t, timeout, opts)), snap))
                 self.apply(results)
             except Exception as e:
                 log("ошибка цикла проверок:", e)
@@ -821,8 +969,13 @@ class Monitor:
                 was_good = t["status"] in GOOD
                 if t["status"] == PENDING or good != was_good:
                     t["since"] = t_now
-                t.update(status=r["status"], detail=r["detail"], ms=r["ms"],
-                         h3=r.get("h3"), kbps=r.get("kbps") if good else None)
+                prev_blocks = [x["code"] for x in t["layers"] if x["state"] == "block"]
+                t.update(status=r["status"], detail=r["detail"], ms=r["ms"], ip=r.get("ip"),
+                         h3=r.get("h3"), kbps=r.get("kbps") if good else None,
+                         layers=[] if good else (r.get("layers") or t["layers"]))
+                blocks = [x["code"] for x in t["layers"] if x["state"] == "block"]
+                if t["group"] == "user" and t["alerted"] and not good and blocks and blocks != prev_blocks:
+                    self.event("bad", t["host"], "блокировки сейчас: " + ", ".join(LAYER_NAMES[c] for c in blocks), t_now)
                 rows.append((tid, t_now, r["status"], r["ms"]))
                 if t["group"] == "user":
                     self._warnings(t, r, good, confirm, t_now)
@@ -844,7 +997,9 @@ class Monitor:
                         t["alerted"] = True
                         t["since"] = t["down_since"]
                         if t["group"] == "user":
-                            self.event("bad", t["host"], f"недоступен — {LABELS[t['status']]}", t_now)
+                            bl = [LAYER_NAMES[x["code"]] for x in t["layers"] if x["state"] == "block"]
+                            self.event("bad", t["host"], f"недоступен — {LABELS[t['status']]}"
+                                       + (" · блокировки: " + ", ".join(bl) if bl else ""), t_now)
                             cur = self._db("INSERT INTO incidents(tid,start,end,status,detail) VALUES(?,?,NULL,?,?)",
                                            (t["id"], t["down_since"], t["status"], t["detail"]))
                             t["incident"] = cur.lastrowid
@@ -1050,6 +1205,13 @@ class Monitor:
             out.append(None if b["bad"] else (round(sum(b["ms"]) / len(b["ms"])) if b["ms"] else 0))
         return out
 
+    def _layers_out(self, t):
+        out = [dict(x, name=LAYER_NAMES[x["code"]]) for x in t["layers"]]
+        if out and self.mode == "whitelist" and t["status"] not in GOOD:
+            out.append(dict(code=L_WL, name=LAYER_NAMES[L_WL], state="block",
+                            text="сейчас действует режим белых списков: пропускаются только разрешённые ресурсы"))
+        return out
+
     def state(self):
         t_now = now_ms()
         with self.lock:
@@ -1059,7 +1221,7 @@ class Monitor:
                                     url=t["url"], status=t["status"], label=LABELS[t["status"]],
                                     detail=t["detail"], ms=t["ms"], since=t["since"], fails=t["fails"],
                                     alerted=t["alerted"], diag_running=t["id"] in self.diag_running,
-                                    warn=t["warn"], h3=t["h3"], kbps=t["kbps"],
+                                    warn=t["warn"], h3=t["h3"], kbps=t["kbps"], layers=self._layers_out(t),
                                     spark=self.spark(t["id"], t_now) if t["group"] == "user" else []))
             next_in = max(0, round(self.next_at - time.time())) if (self.running and self.next_at) else None
             st = dict(version=VERSION, running=self.running, checked_at=self.checked_at, next_in=next_in, now=t_now,
