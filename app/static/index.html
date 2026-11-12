@@ -810,7 +810,7 @@ function renderEvents(){
 function render(){
   $('main').classList.remove('dim'); $('stale').hidden = true;
   var s = S.settings;
-  $('hdrSub').textContent = 'Офисная сеть · проверка каждые ' + s.interval + ' с · тревога после ' + s.confirm + ' ' + gen(s.confirm) + ' подряд';
+  $('hdrSub').textContent = 'Офисная сеть · проверка каждые ' + s.interval + ' с · тревога после ' + s.confirm + ' ' + gen(s.confirm) + ' подряд' + (S.version ? ' · v' + S.version : '');
   renderAuth(); renderVerdict(); renderList(); renderCtl(); renderEvents(); renderFavicon(); renderNBanner();
 }
 function renderStale(){

@@ -45,6 +45,10 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PORT = int(os.environ.get("PORT", "8080"))
 AUTH = os.environ.get("BASIC_AUTH", "").strip()
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+try:
+    VERSION = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")).read().strip()
+except OSError:
+    VERSION = "dev"
 ALT_DNS = os.environ.get("ALT_DNS", "77.88.8.8")
 ALT_DNS_NAME = os.environ.get("ALT_DNS_NAME", "Яндекс DNS" if ALT_DNS.startswith("77.88.8.") else f"DNS {ALT_DNS}")
 GLOBALPING_TOKEN = os.environ.get("GLOBALPING_TOKEN", "").strip()
@@ -848,7 +852,7 @@ class Monitor:
                                     alerted=t["alerted"], diag_running=t["id"] in self.diag_running,
                                     spark=self.spark(t["id"], t_now) if t["group"] == "user" else []))
             next_in = max(0, round(self.next_at - time.time())) if (self.running and self.next_at) else None
-            st = dict(running=self.running, checked_at=self.checked_at, next_in=next_in, now=t_now,
+            st = dict(version=VERSION, running=self.running, checked_at=self.checked_at, next_in=next_in, now=t_now,
                       settings=self.settings, targets=targets)
         with self.db_lock:
             ev = self.db.execute("SELECT t, kind, host, text FROM events ORDER BY t DESC LIMIT 150").fetchall()
@@ -1142,7 +1146,7 @@ def main():
     threading.Thread(target=MON.loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    log(f"ТСПУ-монитор запущен: http://0.0.0.0:{PORT}  (данные: {DATA_DIR}, пароль: {'да' if AUTH else 'нет'})")
+    log(f"ТСПУ-монитор v{VERSION} запущен: http://0.0.0.0:{PORT}  (данные: {DATA_DIR}, пароль: {'да' if AUTH else 'нет'})")
     srv.serve_forever()
 
 

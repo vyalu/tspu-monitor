@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/vyalu/tspu-monitor/releases/latest"><img src="https://img.shields.io/github/v/release/vyalu/tspu-monitor?style=for-the-badge&label=версия&color=1C2128" alt="Последняя версия"></a>
   <img src="https://img.shields.io/badge/Docker-compose-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12">
   <img src="https://img.shields.io/badge/зависимости-0-17703A?style=for-the-badge" alt="Без внешних зависимостей">
@@ -125,7 +126,7 @@ sudo docker compose up -d --build
 ```bash
 cd tspu-monitor && git pull && sudo docker compose up -d --build
 ```
-Адреса, настройки и история хранятся в Docker-томе и при обновлении не теряются.
+Адреса, настройки и история хранятся в Docker-томе и при обновлении не теряются. Текущая версия видна в шапке монитора, что изменилось — в [релизах](https://github.com/vyalu/tspu-monitor/releases) и [CHANGELOG.md](CHANGELOG.md).
 
 > 💡 Если Docker Hub недоступен (`TLS handshake timeout` при сборке), образ Python уже берётся с зеркала `mirror.gcr.io`. Если и оно не отвечает — замените первую строку `Dockerfile` на `FROM dockerhub.timeweb.cloud/library/python:3.12-slim`.
 
@@ -209,6 +210,12 @@ docs/                   — картинки для этой страницы
 ```
 
 Запуск без Docker: `DATA_DIR=./data PORT=8181 python3 app/server.py`
+
+**Новая версия.** Номер — в `app/VERSION`, описание — новым разделом в `CHANGELOG.md`. Затем тег:
+```bash
+git commit -am "Версия 1.3.0" && git tag -a v1.3.0 -m "v1.3.0" && git push origin main v1.3.0
+```
+GitHub Actions сам опубликует релиз с описанием из `CHANGELOG.md` (см. `.github/workflows/release.yml`).
 
 Картинки для README пересоздаются так (нужны `pip install playwright pillow` и `playwright install chromium`):
 ```bash
