@@ -161,7 +161,7 @@ sudo docker compose up -d --build
 
 **Обновление:**
 ```bash
-cd tspu-monitor && git pull && sudo docker compose up -d --build
+cd ~/tspu-monitor && git pull && sudo docker compose up -d --build
 ```
 Адреса, настройки и история хранятся в Docker-томе и при обновлении не теряются. Текущая версия видна в шапке монитора, что изменилось — в [релизах](https://github.com/vyalu/tspu-monitor/releases) и [CHANGELOG.md](CHANGELOG.md).
 
