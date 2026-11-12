@@ -1,10 +1,15 @@
-# Публикует релиз на GitHub, когда в репозиторий отправлен тег версии vX.Y.Z.
-# Описание релиза берётся из раздела этой версии в CHANGELOG.md.
+# Публикует релиз на GitHub, когда в main меняется номер версии в app/VERSION.
+# Тег vX.Y.Z создаётся автоматически, описание берётся из раздела версии в CHANGELOG.md.
+# Если релиз с таким номером уже есть — ничего не делает.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths:
+      - app/VERSION
+      - .github/workflows/release.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,18 +20,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Версия в теге совпадает с app/VERSION
+      - name: Номер версии
+        id: v
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          file="$(tr -d '[:space:]' < app/VERSION)"
-          if [ "$tag" != "$file" ]; then
-            echo "::error::Тег $GITHUB_REF_NAME не совпадает с app/VERSION ($file)"
-            exit 1
+          ver="$(tr -d '[:space:]' < app/VERSION)"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if gh release view "v$ver" >/dev/null 2>&1; then
+            echo "Релиз v$ver уже опубликован — пропускаю"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Описание из CHANGELOG.md
+        if: steps.v.outputs.skip != '1'
         run: |
-          ver="${GITHUB_REF_NAME#v}"
+          ver="${{ steps.v.outputs.ver }}"
           awk -v v="$ver" '
             index($0, "## [" v "]") == 1 { f = 1; next }
             /^## \[/ { if (f) exit }
@@ -48,10 +57,12 @@ jobs:
           cat notes.md
 
       - name: Релиз
+        if: steps.v.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "ТСПУ-монитор $GITHUB_REF_NAME" \
-            --notes-file notes.md \
-            --verify-tag
+          ver="${{ steps.v.outputs.ver }}"
+          gh release create "v$ver" \
+            --target "$GITHUB_SHA" \
+            --title "ТСПУ-монитор v$ver" \
+            --notes-file notes.md

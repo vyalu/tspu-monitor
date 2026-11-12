@@ -211,11 +211,7 @@ docs/                   — картинки для этой страницы
 
 Запуск без Docker: `DATA_DIR=./data PORT=8181 python3 app/server.py`
 
-**Новая версия.** Номер — в `app/VERSION`, описание — новым разделом в `CHANGELOG.md`. Затем тег:
-```bash
-git commit -am "Версия 1.3.0" && git tag -a v1.3.0 -m "v1.3.0" && git push origin main v1.3.0
-```
-GitHub Actions сам опубликует релиз с описанием из `CHANGELOG.md` (см. `.github/workflows/release.yml`).
+**Новая версия.** Поменяйте номер в `app/VERSION`, добавьте раздел этой версии в `CHANGELOG.md` и отправьте в `main` — GitHub Actions сам создаст тег `vX.Y.Z` и опубликует релиз с описанием из `CHANGELOG.md` (см. `.github/workflows/release.yml`).
 
 Картинки для README пересоздаются так (нужны `pip install playwright pillow` и `playwright install chromium`):
 ```bash
