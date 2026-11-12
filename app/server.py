@@ -83,16 +83,20 @@ CONTROLS = [
 # Голосование большинством: «работают» — не меньше 75 %, «лежат» — работают не больше 25 %
 MOSTLY_UP, MOSTLY_DOWN = 0.75, 0.25
 
-PENDING, OK, SMALL, DNS, DNS_SPOOF, IP, REFUSED, SNI, CERT, S1620, STALL, ERR = (
+PENDING, OK, SMALL, DNS, DNS_SPOOF, IP, REFUSED, SNI, CERT, S1620, STALL, ERR, DENIED, HTTP_ERR = (
     "PENDING", "OK", "OK_SMALL", "DNS", "DNS_SPOOF", "IP_BLOCK", "REFUSED", "SNI_BLOCK",
-    "FAKE_CERT", "TCP_16_20", "STALL", "ERROR")
+    "FAKE_CERT", "TCP_16_20", "STALL", "ERROR", "HTTP_DENIED", "HTTP_ERROR")
 LABELS = {
     PENDING: "проверяется…", OK: "работает", SMALL: "работает",
     DNS: "не резолвится DNS", DNS_SPOOF: "адрес из вашего DNS не работает, другой работает", IP: "нет соединения: блок по IP / белый список",
     REFUSED: "соединение отклонено", SNI: "обрыв на TLS: блок по SNI",
     CERT: "подменённый сертификат (заглушка?)", S1620: "замирает после ~16–20 КБ: TCP 16-20",
     STALL: "данные перестали идти", ERR: "ошибка",
+    DENIED: "сервер отказал в доступе (HTTP 403/451)", HTTP_ERR: "сервер ответил ошибкой HTTP",
 }
+MAX_REDIRECTS = 5
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 GOOD = {OK, SMALL}
 
 now_ms = lambda: int(time.time() * 1000)
@@ -230,9 +234,10 @@ def probe(t, ip, timeout, t0=None):
             return res
 
     req = (f"GET {t['path']} HTTP/1.1\r\nHost: {t['host']}\r\n"
-           "User-Agent: Mozilla/5.0 (X11; Linux x86_64) tspu-monitor\r\n"
-           "Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n")
-    got, broke = 0, None
+           f"User-Agent: {BROWSER_UA}\r\n"
+           "Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: ru-RU,ru;q=0.9,en;q=0.8\r\n"
+           "Accept-Encoding: identity\r\nConnection: close\r\n\r\n")
+    got, broke, head = 0, None, b""
     try:
         sock.settimeout(timeout)
         sock.sendall(req.encode())
@@ -240,6 +245,8 @@ def probe(t, ip, timeout, t0=None):
             chunk = sock.recv(16384)
             if not chunk:
                 break
+            if len(head) < 16384:
+                head += chunk[:16384 - len(head)]
             got += len(chunk)
     except socket.timeout:
         broke = "таймаут"
@@ -252,6 +259,11 @@ def probe(t, ip, timeout, t0=None):
             pass
 
     res["ms"] = int((time.monotonic() - t0) * 1000)
+    hdr = head.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
+    m = re.match(r"HTTP/\d(?:\.\d)? (\d{3})", hdr)
+    res["http"] = int(m.group(1)) if m else None
+    loc = re.search(r"(?im)^location:[ \t]*(\S+)", hdr)
+    res["location"] = loc.group(1).strip() if loc else None
     if broke:
         if got == 0:
             res.update(status=STALL, detail=f"нет ответа после соединения ({broke})")
@@ -266,8 +278,54 @@ def probe(t, ip, timeout, t0=None):
     return res
 
 
+def http_verdict(res):
+    """Код ответа сервера → статус. Вызывается только когда данные пришли без обрыва."""
+    code = res.get("http")
+    if code in (403, 451):
+        why = "недоступно по юридическим причинам" if code == 451 else "возможна геоблокировка или защита от ботов"
+        res.update(status=DENIED, detail=f"HTTP {code}: {why}")
+    elif code in (404, 410):
+        res.update(status=HTTP_ERR, detail=f"HTTP {code}: страница не найдена — проверьте адрес")
+    elif code and code >= 500:
+        res.update(status=HTTP_ERR, detail=f"HTTP {code}: ошибка на стороне сервера")
+    return res
+
+
 def check(t, timeout):
-    """Полная проверка: системный DNS → probe; при сбое сверяемся с альтернативным DNS."""
+    """Полная проверка ресурса пользователя: как check_one, но идём по перенаправлениям
+    до конечной страницы (как браузер) и учитываем код ответа сервера."""
+    t0 = time.monotonic()
+    res = check_one(t, timeout)
+    if t.get("group") not in (None, "user") or t["scheme"] == "tcp" or res["status"] not in GOOD:
+        return res
+    chain = []
+    cur, seen = t, {t["url"]}
+    while 300 <= (res.get("http") or 0) < 400 and res.get("location") and len(chain) < MAX_REDIRECTS:
+        base = f"{cur['scheme']}://{cur['host']}" + (f":{cur['port']}" if cur["port"] not in (80, 443) else "") + cur["path"]
+        nxt = parse_url(urllib.parse.urljoin(base, res["location"]))
+        if not nxt or nxt["scheme"] == "tcp" or nxt["url"] in seen:
+            break
+        seen.add(nxt["url"])
+        chain.append(nxt["host"] + (f":{nxt['port']}" if nxt["port"] not in (80, 443) else "")
+                     + (nxt["path"] if nxt["path"] != "/" else ""))
+        cur = dict(nxt, group=t.get("group"))
+        res = check_one(cur, timeout)
+        if res["status"] not in GOOD:
+            break
+    if res["status"] in GOOD:
+        http_verdict(res)
+    if res["status"] in GOOD and 300 <= (res.get("http") or 0) < 400:
+        res.update(status=HTTP_ERR, detail="перенаправления зациклились или их больше " + str(MAX_REDIRECTS))
+    if chain:
+        res["ms"] = int((time.monotonic() - t0) * 1000) if res.get("ms") is not None else None
+        via = "после перенаправления на " + " → ".join(chain)
+        res["detail"] = (via + (": " + res["detail"] if res.get("detail") else "")) if res["status"] not in GOOD \
+            else (via + (" · " + res["detail"] if res.get("detail") else ""))
+    return res
+
+
+def check_one(t, timeout):
+    """Проверка одного адреса: системный DNS → probe; при сбое сверяемся с альтернативным DNS."""
     t0 = time.monotonic()
     try:
         ip = socket.getaddrinfo(t["host"], t["port"], socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
