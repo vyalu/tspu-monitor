@@ -101,15 +101,19 @@ LABELS = {
     STALL: "данные перестали идти", ERR: "ошибка",
     DENIED: "сервер отказал в доступе (HTTP 403/451)", HTTP_ERR: "сервер ответил ошибкой HTTP",
     STUB: "заглушка о блокировке вместо сайта",
+    "TLS_SLOW": "сильное замедление: TLS по имени сайта еле проходит",
 }
+TLS_SLOW = "TLS_SLOW"
 # Предупреждения: сайт открывается, но что-то не так. Тревогу не поднимают.
 WARN_ECH, WARN_QUIC, WARN_SLOW, WARN_CHANGED = "ECH", "QUIC", "SLOW", "CHANGED"
 WARN_NAMES = {WARN_ECH: "сайт публикует ECH", WARN_QUIC: "HTTP/3 (QUIC) не проходит",
               WARN_SLOW: "замедление", WARN_CHANGED: "ответ не похож на обычный"}
 # Уровни блокировки: какие механизмы сейчас действуют на ресурс (может быть несколько сразу)
 L_DNS, L_IP, L_SNI, L_DATA, L_HTTP, L_QUIC, L_WL = "DNS", "IP", "SNI", "DATA", "HTTP", "QUIC", "WL"
-LAYER_NAMES = {L_DNS: "DNS", L_IP: "по IP", L_SNI: "по SNI", L_DATA: "обрыв загрузки",
-               L_HTTP: "заглушка / отказ", L_QUIC: "HTTP/3 (QUIC)", L_WL: "белые списки"}
+STEP_NAMES = {L_DNS: "DNS", L_IP: "IP-адрес", L_SNI: "Имя (SNI)", L_DATA: "Загрузка",
+              L_HTTP: "Ответ сайта", L_QUIC: "HTTP/3", L_WL: "Белые списки"}
+LAYER_NAMES = {L_DNS: "DNS", L_IP: "по IP", L_SNI: "по имени (SNI)", L_DATA: "обрыв загрузки",
+               L_HTTP: "заглушка / отказ", L_QUIC: "HTTP/3", L_WL: "белые списки"}
 LAYER_TTL = 120        # разбор по уровням для одного ресурса — не чаще раза в 2 минуты
 EXTRA_TTL = 1800       # запись HTTPS в DNS (ECH, h3) перечитываем раз в 30 минут
 QUIC_TTL = 600         # QUIC проверяем не чаще раза в 10 минут на адрес
@@ -516,92 +520,158 @@ def tls_try(ip, port, sni, timeout):
             pass
 
 
+SLOW_TLS_WAIT = 20     # сколько ждать TLS-рукопожатие, чтобы отличить замедление от блокировки
+
+
+def tls_slow_test(ip, port, host):
+    """Рукопожатие с длинным ожиданием. Возвращает секунды, если прошло, иначе None."""
+    t0 = time.monotonic()
+    if tls_try(ip, port, host, SLOW_TLS_WAIT) == "ok":
+        return round(time.monotonic() - t0, 1)
+    return None
+
+
+def neutral_fallback():
+    """Запасные посторонние серверы для проверки SNI — адреса контрольных сайтов, сначала зарубежные."""
+    def run():
+        ips = []
+        for _cid, _g, _n, url in sorted(CONTROLS, key=lambda c: c[1] != "foreign"):
+            try:
+                ips.append(socket.getaddrinfo(urllib.parse.urlsplit(url).hostname, 443,
+                                              socket.AF_INET, socket.SOCK_STREAM)[0][4][0])
+            except (OSError, UnicodeError):
+                pass
+        return ips
+    return _cached(("neutral",), 1800, run)
+
+
 def sni_test(host, neutral, timeout):
     """Режут ли имя сайта само по себе: отправляем его в TLS на заведомо доступный посторонний сервер.
-    Сравниваем с тем же сервером и случайным безобидным именем — так поведение сервера не путается с блокировкой."""
+    Сравниваем с тем же сервером и случайным безобидным именем — так поведение сервера не путается с блокировкой.
+    Возвращает (состояние, пояснение): ok / block / unknown."""
     dummy = f"check-{secrets.token_hex(4)}.example.com"
+    tried = 0
     for ip in neutral:
+        if tried >= 4:
+            break
+        tried += 1
         base = tls_try(ip, 443, dummy, timeout)
         if base not in ("ok", "eof"):
             continue          # посторонний сервер сейчас сам недоступен — берём следующий
         got = tls_try(ip, 443, host, timeout)
         if got == base or got == "ok":
-            return dict(code=L_SNI, state="ok", text="имя сайта не в списке ТСПУ: с ним соединение с посторонним сервером проходит")
-        how = {"reset": "соединение сбрасывается", "timeout": "соединение замирает", "eof": "соединение обрывается",
-               "tcp": "соединение не устанавливается"}.get(got, got)
-        return dict(code=L_SNI, state="block", text=f"имя сайта в списке ТСПУ: с ним {how} даже на постороннем сервере ({ip})")
-    return dict(code=L_SNI, state="unknown", text="не с чем сравнить: нет доступного контрольного сервера")
+            return "ok", "с именем этого сайта соединение с посторонним сервером проходит — имя не в списке ТСПУ"
+        how = {"reset": "сбрасывается", "timeout": "замирает", "eof": "обрывается",
+               "tcp": "не устанавливается"}.get(got, got)
+        return "block", f"имя сайта в списке ТСПУ: с ним соединение {how} даже с посторонним сервером ({ip})"
+    return "unknown", "не с чем сравнить: посторонние серверы сейчас недоступны"
+
+
+# Шаги проверки в порядке, как их проходит браузер. HTTP/3 — отдельный путь, белые списки — общий режим.
+STEP_ORDER = [L_DNS, L_IP, L_SNI, L_DATA, L_HTTP]
+MAIN_STEP = {DNS: L_DNS, DNS_SPOOF: L_DNS, IP: L_IP, REFUSED: L_IP, SNI: L_SNI, CERT: L_HTTP,
+             S1620: L_DATA, STALL: L_DATA, STUB: L_HTTP, TLS_SLOW: L_SNI, DENIED: L_HTTP, HTTP_ERR: L_HTTP}
 
 
 def layers(at, res, opts, timeout):
-    """Разбор по уровням: какие блокировки сейчас действуют на ресурс. Основная проверка
-    останавливается на первом сбое; здесь проверяем каждый уровень отдельно."""
+    """Разбор по шагам: какие блокировки сейчас действуют на ресурс. Основная проверка
+    останавливается на первом сбое; здесь DNS, IP, имя сайта и HTTP/3 проверяются каждый отдельно.
+    Результат — шаги в постоянном порядке, у каждого состояние ok / block / unknown / skip."""
     st, host, port, scheme = res["status"], at["host"], at["port"], at["scheme"]
     timeout = min(timeout, 5)
-    out = []
-    if scheme == "tcp" or IP_RE.match(host):
-        if st in (IP, REFUSED):
-            out.append(dict(code=L_IP, state="block", text=LABELS[st]))
-        else:
-            out.append(dict(code=L_IP, state="ok", text="TCP-соединение устанавливается"))
-        if scheme == "https" and st == SNI:
-            out.append(dict(code=L_SNI, state="unknown", text="по голому IP имя сайта не передаётся"))
-    else:
+    by_ip = scheme == "tcp" or bool(IP_RE.match(host))
+    L = {}
+    real = host if by_ip else None
+    if not by_ip:
         try:
             sys_ip = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
         except (OSError, UnicodeError):
             sys_ip = None
         alt = alt_resolve(host)
         if st == DNS:
-            out.append(dict(code=L_DNS, state="block" if alt else "unknown",
-                            text=f"системный DNS не отдаёт адрес, {ALT_DNS_NAME} отдаёт {alt[0]}" if alt
-                            else "имени не знает ни один DNS — возможно, адрес указан с ошибкой"))
+            L[L_DNS] = ("block", f"системный DNS не отдаёт адрес, а {ALT_DNS_NAME} отдаёт {alt[0]}") if alt else \
+                ("unknown", "имени не знает ни один DNS — возможно, адрес указан с ошибкой")
         elif st == DNS_SPOOF:
-            out.append(dict(code=L_DNS, state="block", text=res.get("detail") or LABELS[DNS_SPOOF]))
+            L[L_DNS] = ("block", res.get("detail") or LABELS[DNS_SPOOF])
         else:
-            out.append(dict(code=L_DNS, state="ok", text="адрес получен"))
+            L[L_DNS] = ("ok", f"адрес получен: {sys_ip}" if sys_ip else "адрес получен")
         real = (alt[0] if alt else None) if st in (DNS, DNS_SPOOF) else (sys_ip or (alt[0] if alt else None))
-        jobs = {}
-        if real:
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                def ip_job():
-                    try:
-                        socket.create_connection((real, port), timeout=timeout).close()
-                        return dict(code=L_IP, state="ok", text=f"TCP-соединение с {real} устанавливается")
-                    except ConnectionRefusedError:
-                        return dict(code=L_IP, state="block", text=f"{real}: соединение отклонено")
-                    except OSError:
-                        return dict(code=L_IP, state="block", text=f"{real}: TCP-соединение не устанавливается")
-                jobs["ip"] = ex.submit(ip_job)
-                if scheme == "https" and not is_private(real):
-                    neutral = [x for x in opts.get("neutral", []) if x != real]
-                    jobs["sni"] = ex.submit(sni_test, host, neutral, timeout)
-                    info = _cached(("https", host), EXTRA_TTL, lambda: dns_https(host))
-                    if opts.get("quic", True) and (host in H3_SEEN or "h3" in info["alpn"]):
-                        def q_job():
-                            def run():
-                                try:
-                                    return quic.probe(real, host, port, timeout=3)
-                                except OSError:
-                                    return None
-                            ok = _cached(("quic", host, real, port), QUIC_TTL, run)
-                            if ok is None:
-                                return dict(code=L_QUIC, state="unknown", text="UDP недоступен для проверки")
-                            return dict(code=L_QUIC, state="ok" if ok else "block",
-                                        text="QUIC проходит" if ok else "первый пакет QUIC с именем сайта остаётся без ответа")
-                        jobs["quic"] = ex.submit(q_job)
-                for k in ("ip", "sni", "quic"):
-                    if k in jobs:
-                        try:
-                            out.append(jobs[k].result())
-                        except Exception as e:
-                            log("разбор по уровням", host, k, e)
-        else:
-            out.append(dict(code=L_IP, state="unknown", text="адрес сайта неизвестен — проверить нечем"))
-    if st in (S1620, STALL):
-        out.append(dict(code=L_DATA, state="block", text=LABELS[st]))
-    if st in (STUB, CERT, DENIED):
-        out.append(dict(code=L_HTTP, state="block", text=LABELS[st]))
+    quic_state = None
+    if real:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            def ip_job():
+                try:
+                    socket.create_connection((real, port), timeout=timeout).close()
+                    return "ok", f"TCP-соединение с {real} устанавливается"
+                except ConnectionRefusedError:
+                    return "block", f"{real}: соединение отклонено"
+                except OSError:
+                    return "block", f"{real}: TCP-соединение не устанавливается — адрес недоступен из этой сети"
+            j_ip = ex.submit(ip_job)
+            j_sni = j_q = None
+            if scheme == "https" and not by_ip and not is_private(real):
+                cand = [x for x in opts.get("neutral", []) if x != real]
+                cand += [x for x in neutral_fallback() if x != real and x not in cand]
+                j_sni = ex.submit(sni_test, host, cand, timeout)
+                info = _cached(("https", host), EXTRA_TTL, lambda: dns_https(host))
+                if opts.get("quic", True) and (host in H3_SEEN or "h3" in info["alpn"]):
+                    def q_job():
+                        def run():
+                            try:
+                                return quic.probe(real, host, port, timeout=3)
+                            except OSError:
+                                return None
+                        return _cached(("quic", host, real, port), QUIC_TTL, run)
+                    j_q = ex.submit(q_job)
+            L[L_IP] = j_ip.result()
+            if j_sni:
+                L[L_SNI] = j_sni.result()
+            if j_q:
+                ok = j_q.result()
+                quic_state = ("unknown", "UDP недоступен для проверки") if ok is None else \
+                    ("ok", "QUIC проходит") if ok else \
+                    ("block", "первый пакет QUIC с именем сайта остаётся без ответа — HTTP/3 режется")
+    else:
+        L[L_IP] = ("unknown", "адрес сайта неизвестен — проверить нечем")
+
+    # Сверка с основной проверкой: шаг, на котором она сломалась, — точно блок (или сбой)
+    main = MAIN_STEP.get(st)
+    slow = None
+    if main == L_SNI and real and not by_ip and "timed out" in (res.get("detail") or "").lower():
+        slow = _cached(("slowtls", host, real, port), LAYER_TTL, lambda: tls_slow_test(real, port, host))
+    if slow is not None:
+        sec = str(slow).replace(".", ",")
+        L[L_SNI] = ("block", f"не блокируется полностью, а сильно замедляется: TLS-рукопожатие прошло только за {sec} с "
+                             "(обычно меньше секунды) — так ТСПУ замедляет сайты по имени", "замедление по имени (SNI)")
+    elif main == L_SNI:
+        cur = L.get(L_SNI)
+        if by_ip:
+            L[L_SNI] = ("block", "соединение есть, а TLS рвётся; по голому IP имя сайта не передаётся — значит, режут по адресу")
+        elif cur and cur[0] == "ok":
+            L[L_SNI] = ("block", "имя сайта не в списке ТСПУ, но TLS именно с этим сервером рвётся — "
+                                 "блок по адресу и порту или сбой на сервере")
+        elif not cur or cur[0] == "unknown":
+            L[L_SNI] = ("block", "соединение с сервером есть, а TLS с именем сайта не проходит — почти наверняка "
+                                 "блок по имени (SNI); сверить на постороннем сервере не удалось")
+    elif main and (main not in L or L[main][0] != "block") and not (main == L_DNS and L[L_DNS][0] == "unknown"):
+        L[main] = ("block", LABELS[st])
+    # шаги после места сбоя, которые отдельно не проверить, — «не дошло»
+    if scheme == "https" and L_SNI not in L:
+        L[L_SNI] = ("unknown", "внутренний адрес — посторонний сервер для сверки не используется") if real and is_private(real) \
+            else ("skip", "не дошло: проверка остановилась раньше")
+    reached = STEP_ORDER.index(main) if main in STEP_ORDER else len(STEP_ORDER)
+    for code in (L_DATA, L_HTTP):
+        if code not in L:
+            L[code] = ("ok", "данные приходят") if STEP_ORDER.index(code) < reached else \
+                ("skip", "не дошло: проверка остановилась раньше")
+    out = []
+    for code in STEP_ORDER:
+        if code in L and not (code == L_SNI and scheme != "https") and not (code == L_DNS and by_ip):
+            out.append(dict(code=code, state=L[code][0], text=L[code][1]))
+            if len(L[code]) > 2:
+                out[-1]["bname"] = L[code][2]
+    if quic_state:
+        out.append(dict(code=L_QUIC, state=quic_state[0], text=quic_state[1]))
     return out
 
 
@@ -613,6 +683,9 @@ def check_full(t, timeout, opts):
         try:
             res["layers"] = _cached(("layers", at["url"], res["status"]), LAYER_TTL,
                                     lambda: layers(at, res, opts, timeout))
+            slow = [x for x in res["layers"] if x.get("bname", "").startswith("замедление")]
+            if slow:
+                res.update(status=TLS_SLOW, detail=slow[0]["text"])
         except Exception as e:
             log("разбор по уровням", at["host"], e)
     res.pop("at", None)
@@ -969,13 +1042,13 @@ class Monitor:
                 was_good = t["status"] in GOOD
                 if t["status"] == PENDING or good != was_good:
                     t["since"] = t_now
-                prev_blocks = [x["code"] for x in t["layers"] if x["state"] == "block"]
+                prev_blocks = [x.get("bname") or x["code"] for x in t["layers"] if x["state"] == "block"]
                 t.update(status=r["status"], detail=r["detail"], ms=r["ms"], ip=r.get("ip"),
                          h3=r.get("h3"), kbps=r.get("kbps") if good else None,
                          layers=[] if good else (r.get("layers") or t["layers"]))
-                blocks = [x["code"] for x in t["layers"] if x["state"] == "block"]
+                blocks = [x.get("bname") or x["code"] for x in t["layers"] if x["state"] == "block"]
                 if t["group"] == "user" and t["alerted"] and not good and blocks and blocks != prev_blocks:
-                    self.event("bad", t["host"], "блокировки сейчас: " + ", ".join(LAYER_NAMES[c] for c in blocks), t_now)
+                    self.event("bad", t["host"], "блокировки сейчас: " + ", ".join(LAYER_NAMES.get(c, c) for c in blocks), t_now)
                 rows.append((tid, t_now, r["status"], r["ms"]))
                 if t["group"] == "user":
                     self._warnings(t, r, good, confirm, t_now)
@@ -997,7 +1070,7 @@ class Monitor:
                         t["alerted"] = True
                         t["since"] = t["down_since"]
                         if t["group"] == "user":
-                            bl = [LAYER_NAMES[x["code"]] for x in t["layers"] if x["state"] == "block"]
+                            bl = [x.get("bname") or LAYER_NAMES[x["code"]] for x in t["layers"] if x["state"] == "block"]
                             self.event("bad", t["host"], f"недоступен — {LABELS[t['status']]}"
                                        + (" · блокировки: " + ", ".join(bl) if bl else ""), t_now)
                             cur = self._db("INSERT INTO incidents(tid,start,end,status,detail) VALUES(?,?,NULL,?,?)",
@@ -1206,9 +1279,9 @@ class Monitor:
         return out
 
     def _layers_out(self, t):
-        out = [dict(x, name=LAYER_NAMES[x["code"]]) for x in t["layers"]]
+        out = [dict(x, name=STEP_NAMES[x["code"]], bname=x.get("bname") or LAYER_NAMES[x["code"]]) for x in t["layers"]]
         if out and self.mode == "whitelist" and t["status"] not in GOOD:
-            out.append(dict(code=L_WL, name=LAYER_NAMES[L_WL], state="block",
+            out.append(dict(code=L_WL, name=STEP_NAMES[L_WL], bname=LAYER_NAMES[L_WL], state="block",
                             text="сейчас действует режим белых списков: пропускаются только разрешённые ресурсы"))
         return out
 

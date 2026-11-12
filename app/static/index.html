@@ -166,12 +166,29 @@ main.dim > *{opacity:.55}
 .r-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .r-tags .pill{height:21px;font-size:12px;padding:0 8px;font-weight:500}
 .res.warnc{border-color:var(--warn)}
-.r-lay{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;font-size:12.5px}
-.r-lay .pill{height:22px;font-size:12.5px;padding:0 9px;cursor:help}
-.r-lay .lk{color:var(--muted);margin-right:2px}
-.r-lay .pill.bad{font-weight:700}
-.r-lay .pill.okl{background:transparent;border:1px solid var(--border2);color:var(--muted);font-weight:500}
-.r-lay .pill.unk{background:transparent;border:1px dashed var(--border2);color:var(--muted);font-weight:500}
+/* разбор по шагам */
+.r-full{flex:1 1 100%;min-width:0;border-top:1px solid var(--bad-bd);padding-top:12px;margin-top:-2px;display:flex;flex-direction:column;gap:10px}
+.chain{display:flex;flex-wrap:wrap;align-items:center;gap:6px 4px;list-style:none;margin:0;padding:0}
+.chain .stp{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 11px 0 8px;border-radius:8px;font-size:13.5px;font-weight:600;white-space:nowrap}
+.chain .stp svg{width:16px;height:16px;flex:0 0 16px}
+.chain .stp .q{width:16px;text-align:center;font-weight:700}
+.chain .s-ok{background:var(--surface);color:var(--ok);border:1px solid var(--border)}
+.chain .s-block{background:var(--bad-solid);color:#fff}
+.chain .s-unknown{background:transparent;color:var(--muted);border:1px dashed var(--border2);font-weight:500}
+.chain .s-skip{background:transparent;color:var(--muted);opacity:.6;font-weight:500}
+.chain .arr{color:var(--muted);opacity:.6;display:inline-flex}
+.chain .arr svg{width:14px;height:14px}
+.chain .gap{width:1px;height:20px;background:var(--bad-bd);margin:0 8px}
+.why{display:flex;flex-direction:column;gap:6px;margin:0;padding:0;list-style:none;font-size:13.5px}
+.why li{display:flex;gap:8px;align-items:baseline}
+.why .k{flex:0 0 auto;font-weight:700;color:var(--bad)}
+.why .unk .k{color:var(--muted);font-weight:600}
+.why .unk{color:var(--muted)}
+@media (max-width:620px){ .why li{flex-direction:column;gap:1px} }
+.r-more summary{cursor:pointer;font-size:12.5px;color:var(--muted);width:max-content}
+.r-more summary:hover{color:var(--text)}
+.r-more .mono{font-size:12.5px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .r-spark{flex:0 1 220px;min-width:160px}
 .sp-h{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--muted);margin-bottom:4px}
 .sp-ms{font-size:15px;font-weight:600;color:var(--text)}
@@ -542,7 +559,7 @@ var LABEL = {
   SNI_BLOCK:'обрыв на TLS: блок по SNI', FAKE_CERT:'подменённый сертификат (заглушка?)',
   TCP_16_20:'замирает после ~16–20 КБ: TCP 16-20', STALL:'данные перестали идти', ERROR:'ошибка',
   HTTP_DENIED:'сервер отказал в доступе (HTTP 403/451)', HTTP_ERROR:'сервер ответил ошибкой HTTP',
-  HTTP_STUB:'заглушка о блокировке вместо сайта'
+  HTTP_STUB:'заглушка о блокировке вместо сайта', TLS_SLOW:'сильное замедление: TLS по имени сайта еле проходит'
 };
 var lbl = function(st){ return LABEL[st] || st; };
 
@@ -723,19 +740,27 @@ function spark(t){
 }
 
 /* ---------- ресурсы ---------- */
-function layersHtml(t){
-  var L = t.layers || [];
+var LEG = {ok:'не блокируется', block:'блокировка', unknown:'не удалось проверить', skip:'не дошло — проверка остановилась раньше'};
+function chainHtml(t){
+  var L = (t.layers || []).filter(function(x){ return x.code !== 'WL'; }), wl = (t.layers || []).filter(function(x){ return x.code === 'WL'; })[0];
   if (!L.length) return '';
-  var pill = function(x, cls){ return '<span class="pill '+cls+'" tabindex="0" title="'+esc(x.text)+'">'+esc(x.name)+'</span>'; };
-  var by = function(st){ return L.filter(function(x){ return x.state === st; }); };
-  var b = by('block'), o = by('ok'), u = by('unknown');
-  return '<div class="r-lay"><span class="lk">Блокировки сейчас:</span>' +
-    (b.length ? b.map(function(x){ return pill(x, 'bad'); }).join('') : '<span class="muted">не найдены — похоже на сбой у самого сервера</span>') + '</div>' +
-    (o.length || u.length ? '<div class="r-lay"><span class="lk">Не блокируется:</span>' + (o.length ? o.map(function(x){ return pill(x, 'okl'); }).join('') : '<span class="muted">—</span>') +
-      (u.length ? '<span class="lk" style="margin-left:6px">не проверить:</span>' + u.map(function(x){ return pill(x, 'unk'); }).join('') : '') + '</div>' : '');
+  var mark = function(st){ return st === 'ok' ? ic('check') : st === 'block' ? ic('x') : '<span class="q">'+(st === 'unknown' ? '?' : '–')+'</span>'; };
+  var arr = '<li class="arr" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></li>';
+  var steps = L.map(function(x, i){
+    var sep = i === 0 ? '' : (x.code === 'QUIC' ? '<li class="gap" aria-hidden="true"></li>' : arr);
+    return sep + '<li class="stp s-'+x.state+'" title="'+esc(x.name+': '+LEG[x.state]+'. '+x.text)+'">'+mark(x.state)+esc(x.name)+
+      '<span class="sr">: '+LEG[x.state]+'</span></li>';
+  }).join('');
+  if (wl) steps += '<li class="gap" aria-hidden="true"></li><li class="stp s-block" title="'+esc(wl.text)+'">'+ic('shield')+esc(wl.name)+'</li>';
+  var why = (t.layers || []).filter(function(x){ return x.state === 'block' || x.state === 'unknown'; }).map(function(x){
+    var k = x.state === 'block' ? cap(x.bname || x.name) : 'Не проверить ' + (x.name === 'DNS' ? 'DNS' : x.name.toLowerCase());
+    return '<li class="'+(x.state === 'block' ? 'blk' : 'unk')+'"><span class="k">'+esc(k)+'</span><span>'+esc(x.text)+'</span></li>';
+  }).join('');
+  return '<ol class="chain" aria-label="Проверка по шагам">'+steps+'</ol>' + (why ? '<ul class="why">'+why+'</ul>' : '');
 }
+var cap = function(x){ return x.charAt(0).toUpperCase() + x.slice(1); };
 function layerNames(t){
-  return (t.layers || []).filter(function(x){ return x.state === 'block'; }).map(function(x){ return x.name; }).join(', ');
+  return (t.layers || []).filter(function(x){ return x.state === 'block'; }).map(function(x){ return x.bname || x.name; }).join(', ');
 }
 function speed(k){ return k >= 1000 ? (k / 1000).toFixed(k >= 10000 ? 0 : 1).replace('.', ',') + ' Мбит/с' : k + ' кбит/с'; }
 function card(t){
@@ -751,8 +776,7 @@ function card(t){
     '<div class="r-id"><span class="st c-'+col+'">'+ic(ico)+'</span><div class="r-txt">' +
       '<div class="r-line"><span class="r-name'+(showHost ? '' : ' mono')+'">'+esc(t.name)+'</span>' + (showHost ? '<span class="r-host mono">'+esc(t.host)+'</span>' : '') + '</div>' +
       '<div class="r-status c-'+col+'">'+esc(lbl(t.status))+(w.length ? ', но есть ' + (w.length === 1 ? 'замечание' : 'замечания') : '')+'</div>' +
-      (t.detail ? '<div class="r-detail mono">'+esc(t.detail)+'</div>' : '') +
-      (b ? layersHtml(t) : '') +
+      (t.detail && !(b && (t.layers || []).length) ? '<div class="r-detail mono">'+esc(t.detail)+'</div>' : '') +
       w.map(function(x){ return '<div class="r-warn">'+ic('tri')+'<span>'+esc(x.text)+'</span></div>'; }).join('') +
       (tags.length ? '<div class="r-tags">'+tags.join('')+'</div>' : '') +
       (t.diag_running ? '<div class="r-detail c-info">идёт диагностика…</div>' : '') +
@@ -764,8 +788,11 @@ function card(t){
       '<button class="btn ghost icon" data-act="hist" data-id="'+esc(t.id)+'" aria-label="История '+esc(t.host)+'">'+ic('history')+'</button>' +
       (admin() ? '<button class="btn ghost icon" data-act="rename" data-id="'+esc(t.id)+'" aria-label="Переименовать '+esc(t.host)+'">'+ic('pencil')+'</button>' +
       '<button class="btn ghost icon" data-act="remove" data-id="'+esc(t.id)+'" aria-label="Удалить '+esc(t.host)+'">'+ic('trash')+'</button>' : '') +
-    '</div></article>';
+    '</div>' + (b && (t.layers || []).length ? '<div class="r-full">' + chainHtml(t) +
+      (t.detail ? '<details class="r-more" data-id="'+esc(t.id)+'"'+(openMore[t.id] ? ' open' : '')+'><summary>Технические подробности</summary><div class="mono">'+esc(t.detail)+'</div></details>' : '') +
+      '</div>' : '') + '</article>';
 }
+var openMore = {};
 function emptyCard(){
   if (!admin()) return '<div class="empty"><span class="eico">'+ic('lock')+'</span><h3>Ресурсов пока нет</h3>' +
     '<p class="muted">Добавлять адреса может администратор.</p><button class="btn pri" id="emptyLogin">Войти</button></div>';
@@ -792,6 +819,8 @@ function renderList(){
   var wasEmpty = !!$('addTa2');
   sigList = sig;
   $('list').innerHTML = u.length ? sorted.map(card).join('') : emptyCard();
+  if (!$('list')._more) { $('list')._more = 1; $('list').addEventListener('toggle', function(e){
+    var d = e.target; if (d.classList && d.classList.contains('r-more')) openMore[d.dataset.id] = d.open; }, true); }
   if (!u.length && admin()) {
     $('addBtn2').onclick = function(){ addLinks($('addTa2'), $('addHint2')); };
     if (!wasEmpty) $('addTa2').focus();

@@ -75,16 +75,24 @@ def fake_check(t, timeout, opts=None):
         return dict(status="OK", detail="", ms=jitter(CTL_MS.get(t["id"], 150)))
     host = t["host"]
     if sc == "fail" and host == "crm.example.ru":
-        return dict(status="SNI_BLOCK", detail="ConnectionResetError: [Errno 104] Connection reset by peer", ms=None,
-                    layers=[dict(code="SNI", state="block", text="имя сайта в списке ТСПУ: с ним соединение сбрасывается даже на постороннем сервере"),
-                            dict(code="QUIC", state="block", text="первый пакет QUIC с именем сайта остаётся без ответа"),
-                            dict(code="DNS", state="ok", text="адрес получен"),
-                            dict(code="IP", state="ok", text="TCP-соединение с 203.0.113.20 устанавливается")])
+        return dict(status="TLS_SLOW", ms=None,
+                    detail="не блокируется полностью, а сильно замедляется: TLS-рукопожатие прошло только за 14,2 с "
+                           "(обычно меньше секунды) — так ТСПУ замедляет сайты по имени",
+                    layers=[dict(code="DNS", state="ok", text="адрес получен: 203.0.113.20"),
+                            dict(code="IP", state="ok", text="TCP-соединение с 203.0.113.20 устанавливается"),
+                            dict(code="SNI", state="block", bname="замедление по имени (SNI)",
+                                 text="не блокируется полностью, а сильно замедляется: TLS-рукопожатие прошло только за 14,2 с "
+                                      "(обычно меньше секунды) — так ТСПУ замедляет сайты по имени"),
+                            dict(code="DATA", state="skip", text="не дошло: проверка остановилась раньше"),
+                            dict(code="HTTP", state="skip", text="не дошло: проверка остановилась раньше"),
+                            dict(code="QUIC", state="block", text="первый пакет QUIC с именем сайта остаётся без ответа — HTTP/3 режется")])
     if sc == "whitelist" and host in ("push.example-cloud.com", "mail.example.ru"):
-        return dict(status="IP_BLOCK", detail="таймаут TCP-соединения", ms=None,
-                    layers=[dict(code="IP", state="block", text="TCP-соединение не устанавливается"),
-                            dict(code="DNS", state="ok", text="адрес получен"),
-                            dict(code="SNI", state="ok", text="имя сайта не в списке ТСПУ")])
+        return dict(status="IP_BLOCK", detail="203.0.113.30: таймаут TCP-соединения", ms=None,
+                    layers=[dict(code="DNS", state="ok", text="адрес получен: 203.0.113.30"),
+                            dict(code="IP", state="block", text="203.0.113.30: TCP-соединение не устанавливается — адрес недоступен из этой сети"),
+                            dict(code="SNI", state="ok", text="с именем этого сайта соединение с посторонним сервером проходит — имя не в списке ТСПУ"),
+                            dict(code="DATA", state="skip", text="не дошло: проверка остановилась раньше"),
+                            dict(code="HTTP", state="skip", text="не дошло: проверка остановилась раньше")])
     if t["scheme"] == "tcp":
         return dict(status="OK", detail="TCP-соединение установлено", ms=jitter(BASE.get(host, 50)))
     r = dict(status="OK", detail="", ms=jitter(BASE.get(host, 300)), kbps=jitter(8000), warn=[])
