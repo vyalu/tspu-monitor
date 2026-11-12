@@ -3,6 +3,11 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 Каждая версия отсюда автоматически публикуется как [релиз на GitHub](https://github.com/vyalu/tspu-monitor/releases).
 
+## [1.5.1] — 2026-11-12
+
+### Изменено
+- Под цепочкой шагов объясняется, почему серые шаги не проверены: соединение не проходит дальше шага, где стоит блокировка.
+
 ## [1.5.0] — 2026-11-12
 
 ### Добавлено
@@ -69,6 +74,7 @@
 - История за сутки и неделю, выгрузка CSV, диагностика при сбое (Globalping, сверка DNS, трассировка).
 - Вход администратора, просмотр без входа, Docker с ограниченными привилегиями.
 
+[1.5.1]: https://github.com/vyalu/tspu-monitor/releases/tag/v1.5.1
 [1.5.0]: https://github.com/vyalu/tspu-monitor/releases/tag/v1.5.0
 [1.4.0]: https://github.com/vyalu/tspu-monitor/releases/tag/v1.4.0
 [1.3.0]: https://github.com/vyalu/tspu-monitor/releases/tag/v1.3.0

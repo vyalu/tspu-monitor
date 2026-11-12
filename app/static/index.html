@@ -756,6 +756,9 @@ function chainHtml(t){
     var k = x.state === 'block' ? cap(x.bname || x.name) : 'Не проверить ' + (x.name === 'DNS' ? 'DNS' : x.name.toLowerCase());
     return '<li class="'+(x.state === 'block' ? 'blk' : 'unk')+'"><span class="k">'+esc(k)+'</span><span>'+esc(x.text)+'</span></li>';
   }).join('');
+  var skip = L.filter(function(x){ return x.state === 'skip'; }), stop = L.filter(function(x){ return x.state === 'block' && x.code !== 'QUIC'; }).pop();
+  if (skip.length) why += '<li class="unk"><span class="k">'+esc(skip.map(function(x){ return x.name; }).join(', '))+'</span><span>не проверить: '+
+    (stop ? 'соединение не проходит дальше шага «'+esc(stop.name)+'», до '+(skip.length > 1 ? 'этих шагов' : 'этого шага')+' дело не доходит' : 'проверка до этого шага не дошла')+'</span></li>';
   return '<ol class="chain" aria-label="Проверка по шагам">'+steps+'</ol>' + (why ? '<ul class="why">'+why+'</ul>' : '');
 }
 var cap = function(x){ return x.charAt(0).toUpperCase() + x.slice(1); };
